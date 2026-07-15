@@ -9,6 +9,7 @@
 #include <U8g2lib.h>
 #include <time.h>
 #include <math.h>
+// #include "driver/gpio.h"
 
 // ============================================================
 // MINI OLEG — single-screen weather clock
@@ -38,11 +39,20 @@
 // ============================================================
 
 // ---------------- Display pins ----------------
-static constexpr uint8_t OLED_CLK = 4;
-static constexpr uint8_t OLED_DIN = 6;
-static constexpr uint8_t OLED_CS  = 7;
-static constexpr uint8_t OLED_DC  = 3;
-static constexpr uint8_t OLED_RST = 10;
+
+// 'beautiful wiring' OLED-display pinout
+static constexpr uint8_t OLED_DIN = 10; //0.04
+static constexpr uint8_t OLED_CLK = 8; //0.02-0.05
+static constexpr uint8_t OLED_CS  = 7; //0.01-0.00
+static constexpr uint8_t OLED_DC  = 6; // floating 0.01 - 3.35
+static constexpr uint8_t OLED_RST = 5; //3.33
+
+// initial OLED-display pinout
+// static constexpr uint8_t OLED_DIN = 6;
+// static constexpr uint8_t OLED_CLK = 4;
+// static constexpr uint8_t OLED_CS  = 7;
+// static constexpr uint8_t OLED_DC  = 3;
+// static constexpr uint8_t OLED_RST = 10;
 
 // On-board BOOT button on the common ESP32-C3 Super Mini layout.
 static constexpr uint8_t BOOT_BUTTON_PIN = 9;
@@ -937,7 +947,10 @@ void setup() {
   Serial.println(BUILD_VERSION);
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  // gpio_reset_pin(GPIO_NUM_20);
+  // gpio_reset_pin(GPIO_NUM_21);
 
+  //u8g2.setBusClock(100000);  // 100 кГц — навмисно дуже повільно
   u8g2.begin();
   u8g2.enableUTF8Print();
   u8g2.setContrast(255);
