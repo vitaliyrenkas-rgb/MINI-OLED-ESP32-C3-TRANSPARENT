@@ -7,13 +7,16 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
+#include "sleep_kitty_bitmap.h"
 #include <time.h>
 #include <math.h>
+#include <algorithm>
 // #include "driver/gpio.h"
+
 
 // ============================================================
 // MINI OLEG — single-screen weather clock
-// Build: MINI-003
+// Build: MINI-004 — GPIO1 audio-sense sleep kitty
 // Board: ESP32-C3 Super Mini (Tenstar Robot)
 // Display: Waveshare 1.51" Transparent OLED, SSD1309, 128x64
 // Interface: factory 4-wire SPI
@@ -21,11 +24,17 @@
 // Wiring:
 //   OLED VCC -> 3V3
 //   OLED GND -> GND
-//   OLED CLK -> GPIO4
-//   OLED DIN -> GPIO6
+//   OLED DIN -> GPIO10
+//   OLED CLK -> GPIO8
 //   OLED CS  -> GPIO7
-//   OLED DC  -> GPIO3
-//   OLED RST -> GPIO10
+//   OLED DC  -> GPIO6
+//   OLED RST -> GPIO5
+//
+// Audio presence detector on GPIO1:
+//   MH-M18 L/R -> C1 1 uF (105) -> R1 12 kOhm -> node A -> GPIO1
+//   node A -> R2 100 kOhm -> 3V3
+//   node A -> R3 100 kOhm -> GND
+//   MH-M18 GND -> ESP32-C3 GND
 //
 // Configuration:
 //   First boot automatically starts the local setup portal.
@@ -40,14 +49,14 @@
 
 // ---------------- Display pins ----------------
 
-// 'beautiful wiring' OLED-display pinout
-static constexpr uint8_t OLED_DIN = 10; //0.04
-static constexpr uint8_t OLED_CLK = 8; //0.02-0.05
-static constexpr uint8_t OLED_CS  = 7; //0.01-0.00
-static constexpr uint8_t OLED_DC  = 6; // floating 0.01 - 3.35
-static constexpr uint8_t OLED_RST = 5; //3.33
+// Hardware-passed direct JST wiring. OLED VCC must be 3V3, not 5V.
+static constexpr uint8_t OLED_DIN = 10;
+static constexpr uint8_t OLED_CLK = 8;
+static constexpr uint8_t OLED_CS  = 7;
+static constexpr uint8_t OLED_DC  = 6;
+static constexpr uint8_t OLED_RST = 5;
 
-// initial OLED-display pinout
+// Initial hardware-passed Dupont pinout kept as diagnostic history.
 // static constexpr uint8_t OLED_DIN = 6;
 // static constexpr uint8_t OLED_CLK = 4;
 // static constexpr uint8_t OLED_CS  = 7;
@@ -56,6 +65,8 @@ static constexpr uint8_t OLED_RST = 5; //3.33
 
 // On-board BOOT button on the common ESP32-C3 Super Mini layout.
 static constexpr uint8_t BOOT_BUTTON_PIN = 9;
+static constexpr uint8_t AUDIO_SENSE_PIN = 1;  // ADC1_CH1
+
 
 // Software SPI deliberately matches the display path already verified on LoLin.
 U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
@@ -68,7 +79,7 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
 );
 
 // ---------------- Runtime constants ----------------
-static constexpr char BUILD_VERSION[] = "MINI-003";
+static constexpr char BUILD_VERSION[] = "MINI-004";
 static constexpr char AP_SSID[] = "MINI-OLEG-SETUP";
 static constexpr char AP_PASSWORD[] = "olegsetup";
 static constexpr char DEVICE_HOSTNAME[] = "mini-oleg";
@@ -83,6 +94,15 @@ static constexpr uint32_t WEATHER_RETRY_INTERVAL_MS = 60UL * 1000UL;
 static constexpr uint32_t UI_REDRAW_INTERVAL_MS = 500UL;
 static constexpr uint32_t BOOT_HOLD_FOR_PORTAL_MS = 5000UL;
 static constexpr uint32_t PORTAL_REBOOT_DELAY_MS = 1800UL;
+// static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_MS = 100UL;
+static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_AWAKE_MS = 500UL;
+static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_SLEEP_MS = 100UL;
+static constexpr uint16_t AUDIO_SAMPLE_COUNT = 96;
+static constexpr uint16_t AUDIO_SAMPLE_GAP_US = 150;
+static constexpr uint16_t AUDIO_P2P_THRESHOLD = 80;
+static constexpr uint32_t AUDIO_SILENCE_TIMEOUT_MS = 30UL * 1000UL;
+static constexpr uint32_t AUDIO_DEBUG_INTERVAL_MS = 2000UL;
+static constexpr uint32_t SLEEP_Z_ANIMATION_MS = 650UL;
 
 // ---------------- Stored configuration ----------------
 struct DeviceConfig {
@@ -127,6 +147,15 @@ uint32_t lastNtpAttemptMs = 0;
 uint32_t lastWiFiAttemptMs = 0;
 uint32_t lastUiDrawMs = 0;
 uint32_t bootButtonPressedAtMs = 0;
+// Forward declaration: функція реалізована нижче у скетчі.
+void drawMainScreen();
+
+uint32_t lastAudioSampleMs = 0;
+uint32_t lastAudioSeenMs = 0;
+uint32_t lastAudioDebugMs = 0;
+uint16_t lastAudioPeakToPeak = 0;
+bool sleepKittyActive = false;
+bool forceUiRedraw = true;
 
 // ============================================================
 // Small helpers
@@ -316,6 +345,77 @@ void saveCachedWeather() {
   prefs.putInt("cond", weatherConditionId);
   prefs.putBool("night", weatherIsNight);
   prefs.end();
+}
+
+// ============================================================
+// GPIO1 audio presence detector
+// ============================================================
+
+uint16_t readAudioPeakToPeak() {
+  static uint16_t samples[AUDIO_SAMPLE_COUNT];
+
+  for (uint16_t i = 0; i < AUDIO_SAMPLE_COUNT; ++i) {
+    samples[i] = static_cast<uint16_t>(analogRead(AUDIO_SENSE_PIN));
+    delayMicroseconds(AUDIO_SAMPLE_GAP_US);
+  }
+
+  std::sort(samples, samples + AUDIO_SAMPLE_COUNT);
+
+  // Ігноруємо нижні й верхні 10% вимірів:
+  // одиничні ADC-викиди більше не визначають весь результат.
+  const uint16_t lowIndex  = AUDIO_SAMPLE_COUNT / 10;
+  const uint16_t highIndex = AUDIO_SAMPLE_COUNT - 1 - lowIndex;
+
+  return samples[highIndex] - samples[lowIndex];
+}
+
+void setSleepKittyActive(bool active) {
+  if (sleepKittyActive == active) return;
+
+  sleepKittyActive = active;
+  forceUiRedraw = true;
+
+  Serial.print("Audio screen: ");
+  Serial.println(active ? "sleep kitty" : "main UI");
+}
+
+void serviceAudioSense() {
+  if (portalActive) return;
+
+  const uint32_t now = millis();
+
+  // Поки основний екран активний — не полюємо надто часто
+  // на випадкові ADC-шпичаки.
+  // Коли котик спить — перевіряємо часто для миттєвого пробудження.
+  const uint32_t sampleInterval = sleepKittyActive
+    ? AUDIO_SAMPLE_INTERVAL_SLEEP_MS
+    : AUDIO_SAMPLE_INTERVAL_AWAKE_MS;
+
+  if (now - lastAudioSampleMs < sampleInterval) return;
+  lastAudioSampleMs = now;
+
+  lastAudioPeakToPeak = readAudioPeakToPeak();
+
+  if (lastAudioPeakToPeak >= AUDIO_P2P_THRESHOLD) {
+    lastAudioSeenMs = now;
+    setSleepKittyActive(false);
+  } else if (
+    !sleepKittyActive &&
+    now - lastAudioSeenMs >= AUDIO_SILENCE_TIMEOUT_MS
+  ) {
+    setSleepKittyActive(true);
+  }
+
+  if (now - lastAudioDebugMs >= AUDIO_DEBUG_INTERVAL_MS) {
+    lastAudioDebugMs = now;
+
+    Serial.print("Audio p2p: ");
+    Serial.print(lastAudioPeakToPeak);
+    Serial.print(" / threshold: ");
+    Serial.print(AUDIO_P2P_THRESHOLD);
+    Serial.print(" / screen: ");
+    Serial.println(sleepKittyActive ? "kitty" : "main");
+  }
 }
 
 // ============================================================
@@ -558,6 +658,31 @@ void drawDateBlock(const struct tm* now) {
   // is aligned exactly with the top of the clock digits.
   drawCenteredUtf8InBox(dayText, 94, 34, dayBaselineY, u8g2_font_logisoso18_tn);
   drawCenteredUtf8InBox(monthText, 94, 34, 62, u8g2_font_4x6_t_cyrillic);
+}
+
+void drawSleepZPixelGlyph(int x, int y, uint8_t scale) {
+  const uint8_t width = scale * 3;
+  u8g2.drawBox(x, y, width, scale);
+  u8g2.drawBox(x, y + scale * 4, width, scale);
+
+  for (uint8_t i = 0; i < 3; ++i) {
+    u8g2.drawBox(x + scale * (2 - i), y + scale * (1 + i), scale, scale);
+  }
+}
+
+void drawSleepZAnimation() {
+  const uint8_t frame = (millis() / SLEEP_Z_ANIMATION_MS) % 3;
+
+  drawSleepZPixelGlyph(57, 17, 1);
+  if (frame >= 1) drawSleepZPixelGlyph(66, 12, 1);
+  if (frame >= 2) drawSleepZPixelGlyph(76, 5, 2);
+}
+
+void drawSleepScreen() {
+  u8g2.clearBuffer();
+  u8g2.drawXBMP(0, 0, KITTY_SLEEP_WIDTH, KITTY_SLEEP_HEIGHT, kitty_sleep_128x64);
+  drawSleepZAnimation();
+  u8g2.sendBuffer();
 }
 
 void drawMainScreen() {
@@ -947,10 +1072,13 @@ void setup() {
   Serial.println(BUILD_VERSION);
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(AUDIO_SENSE_PIN, INPUT);
+
+  // Failed GPIO20/21 experiment kept as diagnostic history.
   // gpio_reset_pin(GPIO_NUM_20);
   // gpio_reset_pin(GPIO_NUM_21);
+  // u8g2.setBusClock(100000);
 
-  //u8g2.setBusClock(100000);  // 100 кГц — навмисно дуже повільно
   u8g2.begin();
   u8g2.enableUTF8Print();
   u8g2.setContrast(255);
@@ -969,6 +1097,9 @@ void setup() {
     fetchWeather();
   }
 
+  lastAudioSeenMs = millis();
+  sleepKittyActive = false;
+  forceUiRedraw = false;
   drawMainScreen();
 }
 
@@ -980,12 +1111,33 @@ void loop() {
   }
 
   serviceBootButton();
+  if (portalActive) {
+    delay(2);
+    return;
+  }
+
+  serviceAudioSense();
+
+   
+  const uint32_t now = millis();
+  const uint32_t refreshInterval = sleepKittyActive
+    ? SLEEP_Z_ANIMATION_MS
+    : UI_REDRAW_INTERVAL_MS;
+
+  if (forceUiRedraw || now - lastUiDrawMs >= refreshInterval) {
+    forceUiRedraw = false;
+    lastUiDrawMs = now;
+
+    if (sleepKittyActive) {
+      drawSleepScreen();
+    } else {
+      drawMainScreen();
+    }
+  }
+
   serviceNetwork();
 
-  if (millis() - lastUiDrawMs >= UI_REDRAW_INTERVAL_MS) {
-    lastUiDrawMs = millis();
-    drawMainScreen();
-  }
+
 
   delay(2);
 }
