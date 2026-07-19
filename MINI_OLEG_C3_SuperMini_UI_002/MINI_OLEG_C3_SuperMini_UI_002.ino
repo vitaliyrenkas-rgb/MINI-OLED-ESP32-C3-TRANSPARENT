@@ -10,13 +10,11 @@
 #include "sleep_kitty_bitmap.h"
 #include <time.h>
 #include <math.h>
-#include <algorithm>
 // #include "driver/gpio.h"
-
 
 // ============================================================
 // MINI OLEG — single-screen weather clock
-// Build: MINI-004 — GPIO1 audio-sense sleep kitty
+// Build: MINI-016-KITTY-EASTER-EGG — main-only, kitty kept as Easter egg
 // Board: ESP32-C3 Super Mini (Tenstar Robot)
 // Display: Waveshare 1.51" Transparent OLED, SSD1309, 128x64
 // Interface: factory 4-wire SPI
@@ -68,7 +66,7 @@ static constexpr uint8_t BOOT_BUTTON_PIN = 9;
 static constexpr uint8_t AUDIO_SENSE_PIN = 1;  // ADC1_CH1
 
 
-// Software SPI deliberately matches the display path already verified on LoLin.
+// U8g2 software 4-wire SPI. Pins are explicitly defined for the hardware-passed JST layout.
 U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
   U8G2_R0,
   OLED_CLK,
@@ -79,7 +77,7 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
 );
 
 // ---------------- Runtime constants ----------------
-static constexpr char BUILD_VERSION[] = "MINI-004";
+static constexpr char BUILD_VERSION[] = "MINI-016-KITTY-EASTER-EGG";
 static constexpr char AP_SSID[] = "MINI-OLEG-SETUP";
 static constexpr char AP_PASSWORD[] = "olegsetup";
 static constexpr char DEVICE_HOSTNAME[] = "mini-oleg";
@@ -94,15 +92,40 @@ static constexpr uint32_t WEATHER_RETRY_INTERVAL_MS = 60UL * 1000UL;
 static constexpr uint32_t UI_REDRAW_INTERVAL_MS = 500UL;
 static constexpr uint32_t BOOT_HOLD_FOR_PORTAL_MS = 5000UL;
 static constexpr uint32_t PORTAL_REBOOT_DELAY_MS = 1800UL;
-// static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_MS = 100UL;
-static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_AWAKE_MS = 500UL;
-static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_SLEEP_MS = 100UL;
-static constexpr uint16_t AUDIO_SAMPLE_COUNT = 96;
-static constexpr uint16_t AUDIO_SAMPLE_GAP_US = 150;
-static constexpr uint16_t AUDIO_P2P_THRESHOLD = 80;
+static constexpr uint32_t AUDIO_SAMPLE_INTERVAL_MS = 500UL;
+static constexpr uint8_t AUDIO_SUBWINDOW_COUNT = 4;
+static constexpr uint16_t AUDIO_SUBWINDOW_SAMPLE_COUNT = 40; // 4 * 40 * 500 us = ~80 ms total
+static constexpr uint16_t AUDIO_SAMPLE_GAP_US = 500;
 static constexpr uint32_t AUDIO_SILENCE_TIMEOUT_MS = 30UL * 1000UL;
 static constexpr uint32_t AUDIO_DEBUG_INTERVAL_MS = 2000UL;
 static constexpr uint32_t SLEEP_Z_ANIMATION_MS = 650UL;
+
+// Audio presence detector v6: dynamic gate with softer wake and longer hold.
+// MINI-015 reverses the 014 direction: no extra latch.
+// Wake must be a real sustained music-looking event, not one old peak left in
+// the rolling history. Keep can still be softer after a confirmed wake.
+static constexpr uint16_t AUDIO_DEFAULT_NOISE_FLOOR = 430;
+static constexpr uint16_t AUDIO_WAKE_MARGIN = 70;          // debug/adaptive reference only
+static constexpr uint16_t AUDIO_KEEP_MARGIN = 35;          // debug/adaptive reference only
+static constexpr uint16_t AUDIO_STRONG_MARGIN = 200;       // debug/adaptive reference only
+static constexpr uint16_t AUDIO_ABS_KEEP_MIN = 420;        // debug floor for keep printout
+static constexpr uint16_t AUDIO_ABS_WAKE_MIN = 500;        // debug floor for wake printout
+static constexpr uint16_t AUDIO_ABS_STRONG_MIN = 640;      // strong adds score, not instant wake
+static constexpr uint16_t AUDIO_FLOOR_LEARN_MARGIN = 80;   // learn slow drift, not music bursts
+static constexpr uint8_t AUDIO_SCORE_MAX = 20;
+static constexpr uint8_t AUDIO_SCORE_WAKE = 12;            // needs multiple wake samples
+static constexpr uint8_t AUDIO_SCORE_HIT = 6;
+static constexpr uint8_t AUDIO_SCORE_WEAK_HIT = 2;
+static constexpr uint8_t AUDIO_SCORE_STRONG_HIT = 8;       // no one-shot strong wake
+static constexpr uint8_t AUDIO_SCORE_DECAY = 2;            // release faster than 013
+static constexpr uint16_t AUDIO_FLOOR_MIN = 5;
+static constexpr uint16_t AUDIO_FLOOR_MAX = 700;
+static constexpr uint8_t AUDIO_LEVEL_HISTORY_SIZE = 8;     // 8 * 500 ms = ~4 s activity window
+static constexpr uint16_t AUDIO_DYNAMIC_RANGE_WAKE = 100;  // stricter than 013
+static constexpr uint16_t AUDIO_DYNAMIC_RANGE_KEEP = 55;   // softer after already armed
+static constexpr uint16_t AUDIO_DYNAMIC_PEAK_WAKE = 500;   // suppress 480-ish history ghosts
+static constexpr uint16_t AUDIO_DYNAMIC_PEAK_KEEP = 430;   // hold only after a real wake
+static constexpr uint16_t AUDIO_CURRENT_WAKE_MIN = 440;    // current sample must be alive too
 
 // ---------------- Stored configuration ----------------
 struct DeviceConfig {
@@ -147,15 +170,22 @@ uint32_t lastNtpAttemptMs = 0;
 uint32_t lastWiFiAttemptMs = 0;
 uint32_t lastUiDrawMs = 0;
 uint32_t bootButtonPressedAtMs = 0;
-// Forward declaration: функція реалізована нижче у скетчі.
-void drawMainScreen();
 
 uint32_t lastAudioSampleMs = 0;
 uint32_t lastAudioSeenMs = 0;
 uint32_t lastAudioDebugMs = 0;
 uint16_t lastAudioPeakToPeak = 0;
+uint16_t lastAudioLevel = 0;
+uint16_t audioNoiseFloor = AUDIO_DEFAULT_NOISE_FLOOR;
+uint8_t audioScore = 0;
+bool audioArmed = false;
 bool sleepKittyActive = false;
 bool forceUiRedraw = true;
+uint16_t audioLevelHistory[AUDIO_LEVEL_HISTORY_SIZE] = {0};
+uint8_t audioLevelHistoryCount = 0;
+uint8_t audioLevelHistoryPos = 0;
+uint16_t lastAudioDynamicRange = 0;
+uint16_t lastAudioDynamicPeak = 0;
 
 // ============================================================
 // Small helpers
@@ -351,22 +381,63 @@ void saveCachedWeather() {
 // GPIO1 audio presence detector
 // ============================================================
 
-uint16_t readAudioPeakToPeak() {
-  static uint16_t samples[AUDIO_SAMPLE_COUNT];
+static uint16_t median4(uint16_t a, uint16_t b, uint16_t c, uint16_t d) {
+  uint16_t v[4] = {a, b, c, d};
+  for (uint8_t i = 0; i < 3; ++i) {
+    for (uint8_t j = i + 1; j < 4; ++j) {
+      if (v[j] < v[i]) {
+        const uint16_t t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+      }
+    }
+  }
+  // Upper-middle median makes real sustained signal easier to catch while
+  // still rejecting a single isolated spike in one sub-window.
+  return v[2];
+}
 
-  for (uint16_t i = 0; i < AUDIO_SAMPLE_COUNT; ++i) {
-    samples[i] = static_cast<uint16_t>(analogRead(AUDIO_SENSE_PIN));
-    delayMicroseconds(AUDIO_SAMPLE_GAP_US);
+void readAudioStats(uint16_t& rawP2P, uint16_t& level) {
+  uint16_t subP2P[AUDIO_SUBWINDOW_COUNT] = {0};
+
+  uint16_t globalMin = 4095;
+  uint16_t globalMax = 0;
+
+  for (uint8_t w = 0; w < AUDIO_SUBWINDOW_COUNT; ++w) {
+    uint16_t minSample = 4095;
+    uint16_t maxSample = 0;
+
+    for (uint16_t i = 0; i < AUDIO_SUBWINDOW_SAMPLE_COUNT; ++i) {
+      const uint16_t sample = static_cast<uint16_t>(analogRead(AUDIO_SENSE_PIN));
+      if (sample < minSample) minSample = sample;
+      if (sample > maxSample) maxSample = sample;
+      if (sample < globalMin) globalMin = sample;
+      if (sample > globalMax) globalMax = sample;
+      delayMicroseconds(AUDIO_SAMPLE_GAP_US);
+    }
+
+    subP2P[w] = maxSample - minSample;
   }
 
-  std::sort(samples, samples + AUDIO_SAMPLE_COUNT);
+  rawP2P = globalMax - globalMin;
+  level = median4(subP2P[0], subP2P[1], subP2P[2], subP2P[3]);
+}
 
-  // Ігноруємо нижні й верхні 10% вимірів:
-  // одиничні ADC-викиди більше не визначають весь результат.
-  const uint16_t lowIndex  = AUDIO_SAMPLE_COUNT / 10;
-  const uint16_t highIndex = AUDIO_SAMPLE_COUNT - 1 - lowIndex;
+void updateAudioLevelHistory(uint16_t level) {
+  audioLevelHistory[audioLevelHistoryPos] = level;
+  audioLevelHistoryPos = (audioLevelHistoryPos + 1) % AUDIO_LEVEL_HISTORY_SIZE;
+  if (audioLevelHistoryCount < AUDIO_LEVEL_HISTORY_SIZE) audioLevelHistoryCount++;
 
-  return samples[highIndex] - samples[lowIndex];
+  uint16_t minLevel = 4095;
+  uint16_t maxLevel = 0;
+  for (uint8_t i = 0; i < audioLevelHistoryCount; ++i) {
+    const uint16_t v = audioLevelHistory[i];
+    if (v < minLevel) minLevel = v;
+    if (v > maxLevel) maxLevel = v;
+  }
+
+  lastAudioDynamicPeak = maxLevel;
+  lastAudioDynamicRange = maxLevel - minLevel;
 }
 
 void setSleepKittyActive(bool active) {
@@ -379,40 +450,120 @@ void setSleepKittyActive(bool active) {
   Serial.println(active ? "sleep kitty" : "main UI");
 }
 
+void updateAudioNoiseFloor(uint16_t level, bool wakePulse, bool strongPulse) {
+  // Learn only the quiet envelope. Do not chase repeated activity/strong pulses.
+  if (level < audioNoiseFloor) {
+    audioNoiseFloor = (audioNoiseFloor * 3U + level) / 4U;
+  } else if (!wakePulse && !strongPulse && level <= audioNoiseFloor + AUDIO_FLOOR_LEARN_MARGIN) {
+    audioNoiseFloor = (audioNoiseFloor * 31U + level) / 32U;
+  }
+
+  if (audioNoiseFloor < AUDIO_FLOOR_MIN) audioNoiseFloor = AUDIO_FLOOR_MIN;
+  if (audioNoiseFloor > AUDIO_FLOOR_MAX) audioNoiseFloor = AUDIO_FLOOR_MAX;
+}
+
+void addAudioScore(uint8_t amount) {
+  const uint16_t nextScore = static_cast<uint16_t>(audioScore) + amount;
+  audioScore = nextScore > AUDIO_SCORE_MAX ? AUDIO_SCORE_MAX : static_cast<uint8_t>(nextScore);
+}
+
+void decayAudioScore() {
+  if (audioScore <= AUDIO_SCORE_DECAY) audioScore = 0;
+  else audioScore -= AUDIO_SCORE_DECAY;
+}
+
 void serviceAudioSense() {
   if (portalActive) return;
 
   const uint32_t now = millis();
-
-  // Поки основний екран активний — не полюємо надто часто
-  // на випадкові ADC-шпичаки.
-  // Коли котик спить — перевіряємо часто для миттєвого пробудження.
-  const uint32_t sampleInterval = sleepKittyActive
-    ? AUDIO_SAMPLE_INTERVAL_SLEEP_MS
-    : AUDIO_SAMPLE_INTERVAL_AWAKE_MS;
-
-  if (now - lastAudioSampleMs < sampleInterval) return;
+  if (now - lastAudioSampleMs < AUDIO_SAMPLE_INTERVAL_MS) return;
   lastAudioSampleMs = now;
 
-  lastAudioPeakToPeak = readAudioPeakToPeak();
+  uint16_t rawP2P = 0;
+  uint16_t robustLevel = 0;
+  readAudioStats(rawP2P, robustLevel);
+  lastAudioPeakToPeak = rawP2P;
+  lastAudioLevel = robustLevel;
+  updateAudioLevelHistory(lastAudioLevel);
 
-  if (lastAudioPeakToPeak >= AUDIO_P2P_THRESHOLD) {
+  const uint16_t dynWakeThreshold = audioNoiseFloor + AUDIO_WAKE_MARGIN;
+  const uint16_t dynKeepThreshold = audioNoiseFloor + AUDIO_KEEP_MARGIN;
+  const uint16_t dynStrongThreshold = audioNoiseFloor + AUDIO_STRONG_MARGIN;
+
+  const uint16_t wakeThreshold = dynWakeThreshold < AUDIO_ABS_WAKE_MIN ? AUDIO_ABS_WAKE_MIN : dynWakeThreshold;
+  const uint16_t keepThreshold = dynKeepThreshold < AUDIO_ABS_KEEP_MIN ? AUDIO_ABS_KEEP_MIN : dynKeepThreshold;
+  const uint16_t strongThreshold = dynStrongThreshold < AUDIO_ABS_STRONG_MIN ? AUDIO_ABS_STRONG_MIN : dynStrongThreshold;
+
+  const bool historyReady = audioLevelHistoryCount >= AUDIO_LEVEL_HISTORY_SIZE;
+  const bool strongPulse = lastAudioLevel >= strongThreshold;
+  const bool currentWakeLevel = lastAudioLevel >= AUDIO_CURRENT_WAKE_MIN;
+  const bool dynamicWakePulse = historyReady &&
+                                currentWakeLevel &&
+                                lastAudioDynamicRange >= AUDIO_DYNAMIC_RANGE_WAKE &&
+                                lastAudioDynamicPeak >= AUDIO_DYNAMIC_PEAK_WAKE;
+  const bool dynamicKeepPulse = historyReady &&
+                                lastAudioDynamicRange >= AUDIO_DYNAMIC_RANGE_KEEP &&
+                                lastAudioDynamicPeak >= AUDIO_DYNAMIC_PEAK_KEEP;
+
+  // Important: no plain "level >= keep" score path. Pause/no-audio overlaps
+  // with music by amplitude. Only dynamic movement is allowed to build score.
+  if (strongPulse) {
+    addAudioScore(AUDIO_SCORE_STRONG_HIT);
+  } else if (dynamicWakePulse) {
+    addAudioScore(AUDIO_SCORE_HIT);
+  } else if (audioArmed && dynamicKeepPulse) {
+    addAudioScore(AUDIO_SCORE_WEAK_HIT);
+  } else {
+    decayAudioScore();
+  }
+
+  updateAudioNoiseFloor(lastAudioLevel, dynamicWakePulse, strongPulse);
+
+  // Strong/current pulses build score but do not wake alone. This prevents
+  // a single transient from dragging the cat out of sleep.
+  if (audioScore >= AUDIO_SCORE_WAKE) {
+    audioArmed = true;
+  } else if (audioScore == 0) {
+    audioArmed = false;
+  }
+
+  const bool audioAlive = audioArmed && (strongPulse || dynamicWakePulse || dynamicKeepPulse || audioScore >= AUDIO_SCORE_WAKE);
+  if (audioAlive) {
     lastAudioSeenMs = now;
     setSleepKittyActive(false);
-  } else if (
-    !sleepKittyActive &&
-    now - lastAudioSeenMs >= AUDIO_SILENCE_TIMEOUT_MS
-  ) {
+  } else if (now - lastAudioSeenMs >= AUDIO_SILENCE_TIMEOUT_MS) {
+    audioArmed = false;
     setSleepKittyActive(true);
   }
 
   if (now - lastAudioDebugMs >= AUDIO_DEBUG_INTERVAL_MS) {
     lastAudioDebugMs = now;
-
-    Serial.print("Audio p2p: ");
+    Serial.print("Audio raw: ");
     Serial.print(lastAudioPeakToPeak);
-    Serial.print(" / threshold: ");
-    Serial.print(AUDIO_P2P_THRESHOLD);
+    Serial.print(" / level: ");
+    Serial.print(lastAudioLevel);
+    Serial.print(" / dyn: ");
+    Serial.print(lastAudioDynamicRange);
+    Serial.print(" / peak: ");
+    Serial.print(lastAudioDynamicPeak);
+    Serial.print(" / floor: ");
+    Serial.print(audioNoiseFloor);
+    Serial.print(" / keep: ");
+    Serial.print(keepThreshold);
+    Serial.print(" / wake: ");
+    Serial.print(wakeThreshold);
+    Serial.print(" / score: ");
+    Serial.print(audioScore);
+    Serial.print(" / cw: ");
+    Serial.print(currentWakeLevel ? 1 : 0);
+    Serial.print(" / wp: ");
+    Serial.print(dynamicWakePulse ? 1 : 0);
+    Serial.print(" / kp: ");
+    Serial.print(dynamicKeepPulse ? 1 : 0);
+    Serial.print(" / sp: ");
+    Serial.print(strongPulse ? 1 : 0);
+    Serial.print(" / armed: ");
+    Serial.print(audioArmed ? 1 : 0);
     Serial.print(" / screen: ");
     Serial.println(sleepKittyActive ? "kitty" : "main");
   }
@@ -678,6 +829,9 @@ void drawSleepZAnimation() {
   if (frame >= 2) drawSleepZPixelGlyph(76, 5, 2);
 }
 
+// Dormant easter egg for future generations.
+// Auto sleep/wake by AUDIO_SENSE is disabled in MINI-016,
+// but the kitty drawing code stays here intentionally.
 void drawSleepScreen() {
   u8g2.clearBuffer();
   u8g2.drawXBMP(0, 0, KITTY_SLEEP_WIDTH, KITTY_SLEEP_HEIGHT, kitty_sleep_128x64);
@@ -1073,6 +1227,7 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(AUDIO_SENSE_PIN, INPUT);
+  analogReadResolution(12);
 
   // Failed GPIO20/21 experiment kept as diagnostic history.
   // gpio_reset_pin(GPIO_NUM_20);
@@ -1116,28 +1271,20 @@ void loop() {
     return;
   }
 
-  serviceAudioSense();
-
-   
-  const uint32_t now = millis();
-  const uint32_t refreshInterval = sleepKittyActive
-    ? SLEEP_Z_ANIMATION_MS
-    : UI_REDRAW_INTERVAL_MS;
-
-  if (forceUiRedraw || now - lastUiDrawMs >= refreshInterval) {
-    forceUiRedraw = false;
-    lastUiDrawMs = now;
-
-    if (sleepKittyActive) {
-      drawSleepScreen();
-    } else {
-      drawMainScreen();
-    }
-  }
+  // MINI-016: GPIO1 audio-sense was not reliable in the assembled balalaika.
+  // Keep the sleep kitty code as a dormant easter egg, but never auto-switch
+  // the runtime UI by audio level/noise.
+  // serviceAudioSense();
+  sleepKittyActive = false;
 
   serviceNetwork();
 
-
+  const uint32_t now = millis();
+  if (forceUiRedraw || now - lastUiDrawMs >= UI_REDRAW_INTERVAL_MS) {
+    forceUiRedraw = false;
+    lastUiDrawMs = now;
+    drawMainScreen();
+  }
 
   delay(2);
 }
