@@ -14,7 +14,7 @@
 
 // ============================================================
 // MINI OLEG — single-screen weather clock
-// Build: MINI-021-CLOCK-Y62 — final 2 px downward clock correction
+// Build: MINI-019-CLOCK-BOTTOM-ALIGN — internal battery bolt + lower-edge clock alignment
 // Board: ESP32-C3 Super Mini (Tenstar Robot)
 // Display: Waveshare 1.51" Transparent OLED, SSD1309, 128x64
 // Interface: factory 4-wire SPI
@@ -77,7 +77,7 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
 );
 
 // ---------------- Runtime constants ----------------
-static constexpr char BUILD_VERSION[] = "MINI-021-CLOCK-Y62";
+static constexpr char BUILD_VERSION[] = "MINI-019-CLOCK-BOTTOM-ALIGN";
 static constexpr char AP_SSID[] = "MINI-OLEG-SETUP";
 static constexpr char AP_PASSWORD[] = "olegsetup";
 static constexpr char DEVICE_HOSTNAME[] = "mini-oleg";
@@ -716,15 +716,7 @@ void drawTemperatureBlock(const struct tm* now) {
 }
 
 static constexpr int DATE_DIGIT_TOP_Y = 35;
-
-// Real-screen clock frame:
-//   visible clock top    = y=34 (top line of the Wi-Fi glyph)
-//   visible clock bottom = y=62 (bottom line of the month label)
-// Final hardware correction from the red-line reference photo:
-// move the whole clock 2 px down so its visible top follows the Wi-Fi top
-// and its visible bottom follows the lower edge of the month name.
-static constexpr int CLOCK_X = 13;
-static constexpr int CLOCK_BASELINE_Y = 62;
+static constexpr int LOWER_CONTENT_EDGE_Y = 62;
 
 void drawClockBlock(const struct tm* now) {
   String timeText = "--:--";
@@ -743,17 +735,21 @@ void drawClockBlock(const struct tm* now) {
   );
 
   u8g2.setFont(u8g2_font_logisoso24_tn);
-  u8g2.setFontPosBaseline();
   const int textWidth = u8g2.getUTF8Width(timeText.c_str());
 
-  // Final hardware position: the previous y=60 sat 2 px too high.
-  // Keep baseline mode and lower only the clock cursor to y=62.
-  int x = CLOCK_X;
+  // Align the visible lower edge of the large clock digits with the
+  // lower edge of the month name. This intentionally replaces the old
+  // top-edge alignment, which looked visually uneven on the real OLED.
+  u8g2.setFontPosBottom();
+
+  // Reserve the first 12 px for the complete status column and spacing.
+  int x = 13;
   if (x + textWidth > 90) x = 90 - textWidth;
   if (x < 1) x = 1;
 
-  u8g2.setCursor(x, CLOCK_BASELINE_Y);
+  u8g2.setCursor(x, LOWER_CONTENT_EDGE_Y);
   u8g2.print(timeText);
+  u8g2.setFontPosBaseline();
 }
 
 void drawDateBlock(const struct tm* now) {
