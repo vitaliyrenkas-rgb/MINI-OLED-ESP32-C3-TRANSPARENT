@@ -13,8 +13,8 @@
 // #include "driver/gpio.h"
 
 // ============================================================
-// MINI OLEG — single-screen weather clock
-// Build: MINI-021-CLOCK-Y62 — final 2 px downward clock correction
+// MINI OLED — single-screen weather clock
+// Build: MINI-OLED-v1.0.0 — first public hardware release
 // Board: ESP32-C3 Super Mini (Tenstar Robot)
 // Display: Waveshare 1.51" Transparent OLED, SSD1309, 128x64
 // Interface: factory 4-wire SPI
@@ -36,8 +36,8 @@
 //
 // Configuration:
 //   First boot automatically starts the local setup portal.
-//   AP:       MINI-OLEG-SETUP
-//   Password: olegsetup
+//   AP:       MINI-OLED-SETUP
+//   Password: oledsetup
 //   URL:      http://192.168.4.1
 //
 //   To reopen the portal later, hold the BOOT button for 5 seconds
@@ -77,10 +77,10 @@ U8G2_SSD1309_128X64_NONAME0_F_4W_SW_SPI u8g2(
 );
 
 // ---------------- Runtime constants ----------------
-static constexpr char BUILD_VERSION[] = "MINI-021-CLOCK-Y62";
-static constexpr char AP_SSID[] = "MINI-OLEG-SETUP";
-static constexpr char AP_PASSWORD[] = "olegsetup";
-static constexpr char DEVICE_HOSTNAME[] = "mini-oleg";
+static constexpr char BUILD_VERSION[] = "MINI-OLED-v1.0.0";
+static constexpr char AP_SSID[] = "MINI-OLED-SETUP";
+static constexpr char AP_PASSWORD[] = "oledsetup";
+static constexpr char DEVICE_HOSTNAME[] = "mini-oled";
 
 // Ukraine: EET UTC+2, EEST UTC+3, current last-Sunday DST rule.
 static constexpr char TZ_INFO[] = "EET-2EEST,M3.5.0/3,M10.5.0/4";
@@ -280,7 +280,7 @@ void loadConfig() {
   deviceConfig.weatherLocation = "Kyiv,UA";
 
   Preferences prefs;
-  if (!prefs.begin("mini_oleg", true)) {
+  if (!prefs.begin("mini_oled", true)) {
     Serial.println("Config: cannot open NVS");
     return;
   }
@@ -317,7 +317,7 @@ bool saveConfig() {
   }
 
   Preferences prefs;
-  if (!prefs.begin("mini_oleg", false)) return false;
+  if (!prefs.begin("mini_oled", false)) return false;
 
   prefs.putBool("valid", true);
   prefs.putString("ssid", deviceConfig.wifiSsid);
@@ -459,7 +459,7 @@ void serviceBattery(bool force = false) {
 // ============================================================
 
 void drawWiFiIcon(int x, int y, bool connected) {
-  // Compact 9x10 OLEG-style Wi-Fi glyph.
+  // Compact 9x10 OLED-style Wi-Fi glyph.
   u8g2.drawPixel(x + 0, y + 5);
   u8g2.drawPixel(x + 1, y + 4);
   u8g2.drawPixel(x + 2, y + 3);
@@ -833,7 +833,7 @@ void drawPortalScreen(const String& statusLine = "") {
   u8g2.drawStr(8, 27, AP_SSID);
   u8g2.setFont(u8g2_font_4x6_t_cyrillic);
   u8g2.setCursor(8, 38);
-  u8g2.print("ПАРОЛЬ: olegsetup");
+  u8g2.print("ПАРОЛЬ: oledsetup");
   u8g2.setFont(u8g2_font_5x8_tf);
   u8g2.drawStr(18, 50, "192.168.4.1");
 
@@ -854,14 +854,14 @@ String buildPortalPage(const String& notice = "", bool error = false) {
 
   html += F("<!doctype html><html lang='uk'><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<title>Mini OLEG Setup</title><style>");
+  html += F("<title>Mini OLED Setup</title><style>");
   html += F("body{margin:0;background:#090d0f;color:#d9fbff;font-family:Arial,sans-serif}");
   html += F("main{max-width:520px;margin:auto;padding:18px}.card{background:#10191d;border:1px solid #1f5963;border-radius:14px;padding:16px;box-shadow:0 0 24px #00d9ff18}");
   html += F("h1{margin:4px 0 6px;color:#87f2ff}.hint{color:#9fb4b9;font-size:13px;line-height:1.45}");
   html += F("label{display:block;margin:14px 0 4px;color:#c7edf2;font-size:14px}input{box-sizing:border-box;width:100%;padding:11px;margin-top:5px;border-radius:9px;border:1px solid #31535a;background:#071013;color:#fff;font-size:16px}");
   html += F("button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:10px;background:#75ecff;color:#041014;font-weight:700;font-size:16px}");
   html += F(".notice{padding:10px;border-radius:9px;background:#123b2a;border:1px solid #2e8059}.err{background:#421a1a;border-color:#9d3e3e}.small{font-size:12px;color:#78949a}");
-  html += F("</style></head><body><main><h1>Mini OLEG</h1>");
+  html += F("</style></head><body><main><h1>Mini OLED</h1>");
   html += F("<p class='hint'>Локальне налаштування Wi-Fi та OpenWeather. Дані зберігаються всередині ESP32-C3.</p>");
 
   if (notice.length() != 0) {
@@ -891,7 +891,7 @@ String buildPortalPage(const String& notice = "", bool error = false) {
   html += F("'><span class='small'>Формат: Kyiv,UA або Lviv,UA. На екрані місто не показується.</span></label>");
 
   html += F("<button type='submit'>Зберегти й перезапустити</button></form>");
-  html += F("<p class='hint'>AP: <b>MINI-OLEG-SETUP</b><br>Пароль: <b>olegsetup</b><br>Адреса: <b>192.168.4.1</b></p>");
+  html += F("<p class='hint'>AP: <b>MINI-OLED-SETUP</b><br>Пароль: <b>oledsetup</b><br>Адреса: <b>192.168.4.1</b></p>");
   html += F("</main></body></html>");
 
   return html;
@@ -925,7 +925,7 @@ void portalHandleSave() {
     return;
   }
 
-  portalServer.send(200, "text/html; charset=utf-8", buildPortalPage("Збережено. Mini OLEG зараз перезапуститься."));
+  portalServer.send(200, "text/html; charset=utf-8", buildPortalPage("Збережено. Mini OLED зараз перезапуститься."));
   drawPortalScreen("ЗБЕРЕЖЕНО");
   rebootAtMs = millis() + PORTAL_REBOOT_DELAY_MS;
 }
@@ -1180,7 +1180,7 @@ void setup() {
   Serial.begin(115200);
   delay(120);
   Serial.println();
-  Serial.print("Mini OLEG ");
+  Serial.print("Mini OLED ");
   Serial.println(BUILD_VERSION);
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
